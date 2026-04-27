@@ -1,9 +1,9 @@
 # planning/backlog.md
 
 ## Completed
+- [x] CHAN1: Developer scaffolds claude-channel-slack plugin — structure prête pour le développement itératif ✅ 2026-04-28
 
 ## In Progress
-- [⏳] CHAN1: Developer scaffolds claude-channel-slack plugin — structure prête pour le développement itératif
 
 ## Planned
 - [ ] CHAN2: Utilisateur reçoit et envoie des DMs Slack à Claude via le channel plugin (connexion Socket Mode + pairing + reply tool)
