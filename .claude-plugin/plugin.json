@@ -1,0 +1,6 @@
+{
+  "name": "slack",
+  "description": "Slack channel for Claude Code — bidirectional DM bridge with access control. Manage pairing and allowlist via /slack:access.",
+  "version": "0.0.1",
+  "keywords": ["slack", "messaging", "channel", "mcp"]
+}
