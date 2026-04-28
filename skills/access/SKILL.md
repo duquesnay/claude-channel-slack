@@ -8,6 +8,7 @@ allowed-tools:
   - Bash(ls *)
   - Bash(mkdir *)
   - Bash(cat *)
+  - Bash(curl *)
 ---
 
 # /slack:access
@@ -29,7 +30,7 @@ When invoked with no arguments: Read `~/.claude/channels/slack/access.json` and 
 | `/slack:access` | Show current state: policy, allowlist, pending pairings |
 | `/slack:access pair <code>` | Approve pairing — adds user to allowFrom, sends Slack confirmation |
 | `/slack:access deny <code>` | Discard a pending code |
-| `/slack:access allow <user_id>` | Add a Slack user ID (U...) directly |
+| `/slack:access allow <user_id or name>` | Add by Slack user ID (U...) directly, or resolve by name |
 | `/slack:access remove <user_id>` | Remove from allowlist |
 | `/slack:access policy allowlist` | Set dmPolicy: pairing / allowlist / disabled |
 | `/slack:access group add <channel_id>` | Enable a Slack channel (C...). Flags: `--no-mention`, `--allow U1,U2` |
@@ -49,6 +50,24 @@ When invoked with no arguments: Read `~/.claude/channels/slack/access.json` and 
 Slack user IDs look like `U04AB1CD2EF`. Find yours:
 - Slack profile → three-dot menu → Copy member ID
 - Or: Preferences → Advanced → enable "Always show member ID in member profile"
+
+## User lookup by name (`/slack:access allow <name>`)
+
+When the argument does NOT start with `U` (i.e. it's a name, not a user_id):
+
+1. Read the BOT_TOKEN from `~/.claude/channels/slack/.env`
+2. Call the Slack API:
+   ```bash
+   curl -s "https://slack.com/api/users.list?limit=200" \
+     -H "Authorization: Bearer <BOT_TOKEN>"
+   ```
+3. Filter members where `display_name`, `real_name`, or `name` contains the search term (case-insensitive). Exclude bots and deleted users.
+4. If 0 matches: say "No user found matching '<name>'."
+5. If 1 match: show `real_name (user_id)` and ask for confirmation before adding to allowFrom.
+6. If multiple matches: list all candidates with their user_ids and ask which one to add.
+7. After confirmation: add the chosen `user_id` to `allowFrom` in `access.json` and save.
+
+**Never add to allowFrom without explicit user confirmation.**
 
 ## Pairing implementation
 
