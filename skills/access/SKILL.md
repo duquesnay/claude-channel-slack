@@ -23,7 +23,7 @@ Manage access control for the Slack channel plugin.
 
 When invoked with no arguments: Read `~/.claude/channels/slack/access.json` and display a formatted summary (policy, allowFrom list, pending pairings count, groups). If the file doesn't exist, say "No access.json — default policy: pairing, no users allowlisted."
 
-**IMPORTANT — writing access.json**: Always use `Bash(python3 ...)` to write `access.json`, never the `Write` tool (blocked outside project dir). Pattern:
+**IMPORTANT — writing access.json**: Always use `Bash(python3 ...)` to write `access.json`, never the `Write` tool (blocked outside project dir). **Never modify Claude Code settings files** (`settings.json`, `settings.local.json`) — they are managed externally. Pattern:
 ```bash
 python3 -c "
 import json
