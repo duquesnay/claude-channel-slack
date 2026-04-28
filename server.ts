@@ -254,7 +254,7 @@ if (!STATIC) setInterval(checkApprovals, 5000).unref()
 
 function assertSendable(f: string): void {
   let real: string, stateReal: string
-  try { real = realpathSync(f); stateReal = realpathSync(STATE_DIR) } catch { return }
+  try { real = realpathSync(f); stateReal = realpathSync(STATE_DIR) } catch { throw new Error(`cannot resolve path for sendability check: ${f}`) }
   const inbox = join(stateReal, 'inbox')
   if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
     throw new Error(`refusing to send channel state: ${f}`)
@@ -575,7 +575,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }], isError: true }
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = (err instanceof Error ? err.message : String(err))
+      .replace(/(xox[a-z]-|xapp-)[A-Za-z0-9-]+/g, '[REDACTED]')
     return { content: [{ type: 'text', text: `${req.params.name} failed: ${msg}` }], isError: true }
   }
 })
