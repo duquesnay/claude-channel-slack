@@ -16,6 +16,12 @@ Manage access control for the Slack channel plugin.
 
 **State file**: `~/.claude/channels/slack/access.json`
 
+## Implementation — IMPORTANT
+
+**DO NOT use MCP tools or shell commands.** Use only `Read` and `Write` tools on the state file directly.
+
+When invoked with no arguments: Read `~/.claude/channels/slack/access.json` and display a formatted summary (policy, allowFrom list, pending pairings count, groups). If the file doesn't exist, say "No access.json — default policy: pairing, no users allowlisted."
+
 ## Commands
 
 | Command | Effect |
