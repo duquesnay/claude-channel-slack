@@ -17,7 +17,7 @@ Run `/slack:configure` for the full setup walkthrough.
 **2.** Launch Claude Code with the channel flag:
 
 ```sh
-claude --channels plugin:slack@nestor
+claude --channels plugin:claude-channel-slack@nestor --permission-mode acceptEdits
 ```
 
 **3.** DM your bot on Slack — it replies with a pairing code. In Claude Code:
