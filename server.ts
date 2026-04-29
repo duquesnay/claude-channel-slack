@@ -29,11 +29,10 @@ import { join, sep } from 'path'
 
 const STATE_DIR = process.env.SLACK_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'slack')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
+const ENGAGED_FILE = join(STATE_DIR, 'engaged-threads.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
-const THREADS_FILE = join(STATE_DIR, 'threads.json')
-const THREAD_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 // Load ~/.claude/channels/slack/.env into process.env. Real env wins.
 try {
@@ -61,6 +60,7 @@ if (!BOT_TOKEN || !APP_TOKEN) {
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 const MAX_CHUNK_LIMIT = 3000
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+const ENGAGED_THREAD_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 process.on('unhandledRejection', err => {
   process.stderr.write(`slack channel: unhandled rejection: ${err}\n`)
@@ -95,6 +95,9 @@ type Access = {
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
 }
+
+// Engaged threads: key = `${channelId}:${threadRootTs}`, value = expiry timestamp (ms).
+type EngagedThreads = Record<string, number>
 
 function defaultAccess(): Access {
   return { dmPolicy: 'pairing', allowFrom: [], groups: {}, pending: {} }
@@ -154,47 +157,78 @@ function pruneExpired(a: Access): boolean {
   return changed
 }
 
-function loadThreads(): Record<string, number> {
-  try { return JSON.parse(readFileSync(THREADS_FILE, 'utf8')) } catch { return {} }
+// --- Engaged threads ---
+// Tracks threads the bot is actively participating in, keyed by channelId:threadRootTs.
+// Opportunistic expiry pruning on read; no separate timer.
+
+export function engagedKey(channelId: string, threadRootTs: string): string {
+  return `${channelId}:${threadRootTs}`
 }
 
-function saveThreads(threads: Record<string, number>): void {
+export function pruneEngaged(threads: EngagedThreads, now: number): boolean {
+  let changed = false
+  for (const key of Object.keys(threads)) {
+    if (threads[key] <= now) { delete threads[key]; changed = true }
+  }
+  return changed
+}
+
+export function markEngagedIn(threads: EngagedThreads, channelId: string, threadRootTs: string, now: number): void {
+  threads[engagedKey(channelId, threadRootTs)] = now + ENGAGED_THREAD_TTL_MS
+}
+
+export function isEngagedIn(threads: EngagedThreads, channelId: string, threadRootTs: string, now: number): boolean {
+  const key = engagedKey(channelId, threadRootTs)
+  const expiresAt = threads[key]
+  return expiresAt !== undefined && expiresAt > now
+}
+
+function readEngaged(): EngagedThreads {
+  try {
+    const raw = readFileSync(ENGAGED_FILE, 'utf8')
+    return JSON.parse(raw) as EngagedThreads
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    try { renameSync(ENGAGED_FILE, `${ENGAGED_FILE}.corrupt-${Date.now()}`) } catch {}
+    process.stderr.write(`slack: engaged-threads.json is corrupt, moved aside. Starting fresh.\n`)
+    return {}
+  }
+}
+
+function writeEngaged(threads: EngagedThreads): void {
+  if (STATIC) return
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = THREADS_FILE + '.tmp'
+  const tmp = ENGAGED_FILE + '.tmp'
   writeFileSync(tmp, JSON.stringify(threads) + '\n', { mode: 0o600 })
-  renameSync(tmp, THREADS_FILE)
+  renameSync(tmp, ENGAGED_FILE)
+}
+
+function markEngaged(channelId: string, threadRootTs: string): void {
+  try {
+    const now = Date.now()
+    const threads = readEngaged()
+    pruneEngaged(threads, now)
+    markEngagedIn(threads, channelId, threadRootTs, now)
+    writeEngaged(threads)
+  } catch (err) {
+    process.stderr.write(`slack channel: failed to persist engaged thread (${channelId}:${threadRootTs}): ${err}\n`)
+  }
+}
+
+function isEngaged(channelId: string, threadTs: string): boolean {
+  try {
+    const now = Date.now()
+    const threads = readEngaged()
+    pruneEngaged(threads, now)
+    return isEngagedIn(threads, channelId, threadTs, now)
+  } catch {
+    return false
+  }
 }
 
 // --- Runtime state ---
 
-const recentSentIds = new Set<string>()
-const RECENT_SENT_CAP = 200
 const dmChannelUsers = new Map<string, string>()
-
-// Seed recentSentIds from disk (survives MCP restarts).
-{
-  const stored = loadThreads()
-  const now = Date.now()
-  for (const [ts, addedAt] of Object.entries(stored)) {
-    if (now - addedAt <= THREAD_TTL_MS) recentSentIds.add(ts)
-  }
-}
-
-function noteSent(ts: string): void {
-  if (recentSentIds.has(ts)) return
-  recentSentIds.add(ts)
-  if (recentSentIds.size > RECENT_SENT_CAP) {
-    const first = recentSentIds.values().next().value
-    if (first) recentSentIds.delete(first)
-  }
-  const threads = loadThreads()
-  const now = Date.now()
-  threads[ts] = now
-  for (const [key, addedAt] of Object.entries(threads)) {
-    if (now - addedAt > THREAD_TTL_MS) delete threads[key]
-  }
-  saveThreads(threads)
-}
 
 // Resolved after app.start() — must be let to allow mutation from async boot.
 let BOT_USER_ID = ''
@@ -242,13 +276,14 @@ async function gate(userId: string, channelId: string, channelType: string): Pro
 
 async function isMentioned(
   text: string,
+  channelId: string,
   threadTs: string | undefined,
   parentUserId: string | undefined,
   extraPatterns?: string[],
 ): Promise<boolean> {
   if (BOT_USER_ID && text.includes(`<@${BOT_USER_ID}>`)) return true
   if (parentUserId && BOT_USER_ID && parentUserId === BOT_USER_ID) return true
-  if (threadTs && recentSentIds.has(threadTs)) return true
+  if (threadTs && isEngaged(channelId, threadTs)) return true
   for (const pat of extraPatterns ?? []) {
     try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
   }
@@ -272,7 +307,6 @@ function checkApprovals(): void {
         rmSync(file, { force: true })
       } catch (err) {
         process.stderr.write(`slack channel: failed to send approval confirm: ${err}\n`)
-        rmSync(file, { force: true })
       }
     })()
   }
@@ -515,6 +549,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           for (const f of files) assertSendable(f)
           throw new Error('file attachments not yet supported (TODO CHAN7: files.uploadV2)')
         }
+        // Mark the thread engaged so subsequent replies don't require re-mention.
+        if (reply_to) markEngaged(chat_id, reply_to)
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
@@ -528,8 +564,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             text: chunks[i],
             ...(shouldThread ? { thread_ts: reply_to } : {}),
           })
-          if (res.ts) { noteSent(res.ts); sentTs.push(res.ts) }
-          if (reply_to) noteSent(reply_to)
+          if (res.ts) sentTs.push(res.ts)
         }
         const result = sentTs.length === 1
           ? `sent (ts: ${sentTs[0]})`
@@ -668,8 +703,12 @@ async function handleInbound(msg: SlackMessage & { user: string }): Promise<void
     const access = loadAccess()
     const policy = access.groups[channelId]
     if (policy?.requireMention) {
-      const mentioned = await isMentioned(text, msg.thread_ts, msg.parent_user_id, access.mentionPatterns)
+      const mentioned = await isMentioned(text, channelId, msg.thread_ts, msg.parent_user_id, access.mentionPatterns)
       if (!mentioned) return
+      // Mark the thread engaged so future messages in it reach the bot without re-mention.
+      // thread_ts ?? ts: if bot is mentioned in a top-level message, the bot's reply
+      // creates a thread under it; subsequent thread replies carry thread_ts === original ts.
+      markEngaged(channelId, msg.thread_ts ?? msg.ts)
     }
   }
 
