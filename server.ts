@@ -32,6 +32,8 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const THREADS_FILE = join(STATE_DIR, 'threads.json')
+const THREAD_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 // Load ~/.claude/channels/slack/.env into process.env. Real env wins.
 try {
@@ -152,18 +154,46 @@ function pruneExpired(a: Access): boolean {
   return changed
 }
 
+function loadThreads(): Record<string, number> {
+  try { return JSON.parse(readFileSync(THREADS_FILE, 'utf8')) } catch { return {} }
+}
+
+function saveThreads(threads: Record<string, number>): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  const tmp = THREADS_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify(threads) + '\n', { mode: 0o600 })
+  renameSync(tmp, THREADS_FILE)
+}
+
 // --- Runtime state ---
 
 const recentSentIds = new Set<string>()
 const RECENT_SENT_CAP = 200
 const dmChannelUsers = new Map<string, string>()
 
+// Seed recentSentIds from disk (survives MCP restarts).
+{
+  const stored = loadThreads()
+  const now = Date.now()
+  for (const [ts, addedAt] of Object.entries(stored)) {
+    if (now - addedAt <= THREAD_TTL_MS) recentSentIds.add(ts)
+  }
+}
+
 function noteSent(ts: string): void {
+  if (recentSentIds.has(ts)) return
   recentSentIds.add(ts)
   if (recentSentIds.size > RECENT_SENT_CAP) {
     const first = recentSentIds.values().next().value
     if (first) recentSentIds.delete(first)
   }
+  const threads = loadThreads()
+  const now = Date.now()
+  threads[ts] = now
+  for (const [key, addedAt] of Object.entries(threads)) {
+    if (now - addedAt > THREAD_TTL_MS) delete threads[key]
+  }
+  saveThreads(threads)
 }
 
 // Resolved after app.start() — must be let to allow mutation from async boot.
@@ -499,6 +529,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             ...(shouldThread ? { thread_ts: reply_to } : {}),
           })
           if (res.ts) { noteSent(res.ts); sentTs.push(res.ts) }
+          if (reply_to) noteSent(reply_to)
         }
         const result = sentTs.length === 1
           ? `sent (ts: ${sentTs[0]})`
