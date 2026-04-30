@@ -269,3 +269,28 @@ test('isMentionedPure: empty BOT_USER_ID and BOT_NAME falls through to thread en
   expect(isMentionedPure('hello', undefined, '', '', true)).toBe(true)
   expect(isMentionedPure('hello', undefined, '', '', false)).toBe(false)
 })
+
+// --- hermesSessionKey tests ---
+// Pure helper copied from server.ts. Format matches ~/.hermes/sessions/sessions.json keys.
+
+function hermesSessionKey(channelType: string, chatId: string, threadId: string): string {
+  const kind = channelType === 'im' ? 'dm' : 'group'
+  return `agent:main:slack:${kind}:${chatId}:${threadId}`
+}
+
+test('hermesSessionKey: DM produces dm-prefixed key', () => {
+  expect(hermesSessionKey('im', 'D0ASEN09U5A', '1777265600.962049'))
+    .toBe('agent:main:slack:dm:D0ASEN09U5A:1777265600.962049')
+})
+
+test('hermesSessionKey: channel/group produces group-prefixed key', () => {
+  expect(hermesSessionKey('channel', 'C0AV95P4E91', '1777428105.503689'))
+    .toBe('agent:main:slack:group:C0AV95P4E91:1777428105.503689')
+  expect(hermesSessionKey('group', 'C0ASNC6UE4R', '1775975623.730469'))
+    .toBe('agent:main:slack:group:C0ASNC6UE4R:1775975623.730469')
+})
+
+test('hermesSessionKey: unknown channelType defaults to group (matches Hermes convention for non-DM)', () => {
+  expect(hermesSessionKey('mpim', 'G123', '1700000000.000000'))
+    .toBe('agent:main:slack:group:G123:1700000000.000000')
+})
