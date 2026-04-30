@@ -232,6 +232,7 @@ const dmChannelUsers = new Map<string, string>()
 
 // Resolved after app.start() — must be let to allow mutation from async boot.
 let BOT_USER_ID = ''
+let BOT_NAME = ''
 
 // --- Access control ---
 
@@ -274,6 +275,28 @@ async function gate(userId: string, channelId: string, channelType: string): Pro
   return { action: 'deliver', access }
 }
 
+// Pure decision: should the bot respond to this message?
+// Order matters: explicit mention always wins; Claude composer marker skips
+// non-explicit triggers to avoid Claude replying to its own composer output.
+export function isMentionedPure(
+  text: string,
+  parentUserId: string | undefined,
+  botUserId: string,
+  botName: string,
+  threadEngaged: boolean,
+  extraPatterns?: string[],
+): boolean {
+  if (botUserId && text.includes(`<@${botUserId}>`)) return true
+  if (text.includes('*Sent using* Claude')) return false
+  if (botName && new RegExp(`\\b${botName}\\b`, 'i').test(text)) return true
+  if (parentUserId && botUserId && parentUserId === botUserId) return true
+  if (threadEngaged) return true
+  for (const pat of extraPatterns ?? []) {
+    try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
+  }
+  return false
+}
+
 async function isMentioned(
   text: string,
   channelId: string,
@@ -281,13 +304,8 @@ async function isMentioned(
   parentUserId: string | undefined,
   extraPatterns?: string[],
 ): Promise<boolean> {
-  if (BOT_USER_ID && text.includes(`<@${BOT_USER_ID}>`)) return true
-  if (parentUserId && BOT_USER_ID && parentUserId === BOT_USER_ID) return true
-  if (threadTs && isEngaged(channelId, threadTs)) return true
-  for (const pat of extraPatterns ?? []) {
-    try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
-  }
-  return false
+  const engaged = !!(threadTs && isEngaged(channelId, threadTs))
+  return isMentionedPure(text, parentUserId, BOT_USER_ID, BOT_NAME, engaged, extraPatterns)
 }
 
 // --- Approval polling ---
@@ -867,7 +885,8 @@ await app.start()
 try {
   const authRes = await app.client.auth.test()
   BOT_USER_ID = (authRes.user_id as string) ?? ''
-  process.stderr.write(`slack channel: gateway connected as ${authRes.user as string} (${BOT_USER_ID})\n`)
+  BOT_NAME = (authRes.user as string) ?? ''
+  process.stderr.write(`slack channel: gateway connected as ${BOT_NAME} (${BOT_USER_ID})\n`)
 } catch (err) {
   process.stderr.write(`slack channel: auth.test failed: ${err}\n`)
   process.exit(1)

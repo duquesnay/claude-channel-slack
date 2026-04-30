@@ -197,3 +197,75 @@ test('engaged: readEngagedFrom returns empty map for missing file', () => {
   const result = readEngagedFrom('/nonexistent/path/engaged-threads.json')
   expect(result).toEqual({})
 })
+
+// --- isMentionedPure tests ---
+// Pure decision logic copied from server.ts (kept in sync manually, like engaged helpers above).
+
+function isMentionedPure(
+  text: string,
+  parentUserId: string | undefined,
+  botUserId: string,
+  botName: string,
+  threadEngaged: boolean,
+  extraPatterns?: string[],
+): boolean {
+  if (botUserId && text.includes(`<@${botUserId}>`)) return true
+  if (text.includes('*Sent using* Claude')) return false
+  if (botName && new RegExp(`\\b${botName}\\b`, 'i').test(text)) return true
+  if (parentUserId && botUserId && parentUserId === botUserId) return true
+  if (threadEngaged) return true
+  for (const pat of extraPatterns ?? []) {
+    try { if (new RegExp(pat, 'i').test(text)) return true } catch {}
+  }
+  return false
+}
+
+const BOT_ID = 'U0BOT'
+const BOT = 'claude'
+
+test('isMentionedPure: explicit <@bot> tag triggers, even in engaged thread with Claude composer marker', () => {
+  // Explicit invocation always wins over the composer skip rule
+  expect(isMentionedPure('<@U0BOT> please help *Sent using* Claude', undefined, BOT_ID, BOT, true)).toBe(true)
+})
+
+test('isMentionedPure: Claude composer marker skips response in engaged thread (anti Claude-on-Claude doublon)', () => {
+  expect(isMentionedPure('picking up the cron run *Sent using* Claude', undefined, BOT_ID, BOT, true)).toBe(false)
+})
+
+test('isMentionedPure: Claude composer marker skips even with bot name in text', () => {
+  // Composer-rendered text mentioning "Claude" by name is still a Claude voice — skip
+  expect(isMentionedPure('Hey Claude, can you check this *Sent using* Claude', undefined, BOT_ID, BOT, false)).toBe(false)
+})
+
+test('isMentionedPure: bot name without tag triggers (case-insensitive word boundary)', () => {
+  expect(isMentionedPure('Claude, peux-tu m\'aider ?', undefined, BOT_ID, BOT, false)).toBe(true)
+  expect(isMentionedPure('hey CLAUDE help', undefined, BOT_ID, BOT, false)).toBe(true)
+})
+
+test('isMentionedPure: bot name as substring does not trigger (word boundary respected)', () => {
+  // "claudette" should not match "claude"
+  expect(isMentionedPure('claudette is a name', undefined, BOT_ID, BOT, false)).toBe(false)
+})
+
+test('isMentionedPure: human in engaged thread without tag triggers (regression — engagement preserved)', () => {
+  expect(isMentionedPure('any update on this?', undefined, BOT_ID, BOT, true)).toBe(true)
+})
+
+test('isMentionedPure: another bot in engaged thread without Claude marker triggers (non-Claude bots not skipped)', () => {
+  // Cronjob Response from Jaskier in engaged thread — bot may decide to weigh in
+  expect(isMentionedPure('Cronjob Response: openrouter_spend_monitor', undefined, BOT_ID, BOT, true)).toBe(true)
+})
+
+test('isMentionedPure: parent_user_id pointing to bot triggers (replies to bot message)', () => {
+  expect(isMentionedPure('thanks', BOT_ID, BOT_ID, BOT, false)).toBe(true)
+})
+
+test('isMentionedPure: extraPatterns regex matches', () => {
+  expect(isMentionedPure('hey assistant please help', undefined, BOT_ID, BOT, false, ['\\bassistant\\b'])).toBe(true)
+})
+
+test('isMentionedPure: empty BOT_USER_ID and BOT_NAME falls through to thread engagement', () => {
+  // Boot edge case: auth.test() not yet resolved
+  expect(isMentionedPure('hello', undefined, '', '', true)).toBe(true)
+  expect(isMentionedPure('hello', undefined, '', '', false)).toBe(false)
+})
