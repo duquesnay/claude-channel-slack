@@ -183,6 +183,15 @@ export function isEngagedIn(threads: EngagedThreads, channelId: string, threadRo
   return expiresAt !== undefined && expiresAt > now
 }
 
+// Hermes session_key matches the format Hermes itself uses in ~/.hermes/sessions/sessions.json:
+// agent:main:slack:<dm|group>:<chat_id>:<thread_root_ts>
+// Lets a Claude consumer call mcp__hermes__messages_read(session_key) to retrieve the
+// Hermes-side conversation tied to the same Slack thread.
+export function hermesSessionKey(channelType: string, chatId: string, threadId: string): string {
+  const kind = channelType === 'im' ? 'dm' : 'group'
+  return `agent:main:slack:${kind}:${chatId}:${threadId}`
+}
+
 function readEngaged(): EngagedThreads {
   try {
     const raw = readFileSync(ENGAGED_FILE, 'utf8')
@@ -777,6 +786,7 @@ async function handleInbound(msg: SlackMessage & { user: string }): Promise<void
   })
 
   const content = text || (atts.length > 0 ? '(attachment)' : '')
+  const threadRootTs = msg.thread_ts ?? ts
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
@@ -787,6 +797,8 @@ async function handleInbound(msg: SlackMessage & { user: string }): Promise<void
         user: userId,
         user_id: userId,
         ts: new Date(parseFloat(ts) * 1000).toISOString(),
+        thread_id: threadRootTs,
+        hermes_session_key: hermesSessionKey(channelType, channelId, threadRootTs),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
       },
     },
