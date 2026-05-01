@@ -294,3 +294,123 @@ test('hermesSessionKey: unknown channelType defaults to group (matches Hermes co
   expect(hermesSessionKey('mpim', 'G123', '1700000000.000000'))
     .toBe('agent:main:slack:group:G123:1700000000.000000')
 })
+
+// --- Claude session continuity (per Slack thread) ---
+// Pure logic copied from server.ts. Same TTL/key conventions as engaged-threads.
+
+const CLAUDE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+type ClaudeSession = { sessionId: string; expiresAt: number }
+type ClaudeSessions = Record<string, ClaudeSession>
+
+function pruneClaudeSessions(sessions: ClaudeSessions, now: number): boolean {
+  let changed = false
+  for (const key of Object.keys(sessions)) {
+    if (sessions[key]!.expiresAt <= now) { delete sessions[key]; changed = true }
+  }
+  return changed
+}
+
+function setClaudeSession(sessions: ClaudeSessions, chatId: string, threadRootTs: string, sessionId: string, now: number): void {
+  sessions[engagedKey(chatId, threadRootTs)] = { sessionId, expiresAt: now + CLAUDE_SESSION_TTL_MS }
+}
+
+function getClaudeSession(sessions: ClaudeSessions, chatId: string, threadRootTs: string, now: number): string | undefined {
+  const e = sessions[engagedKey(chatId, threadRootTs)]
+  return e && e.expiresAt > now ? e.sessionId : undefined
+}
+
+test('claudeSessions: setClaudeSession then getClaudeSession returns the id within TTL', () => {
+  const s: ClaudeSessions = {}
+  const now = Date.now()
+  setClaudeSession(s, 'C1', 'T1', 'uuid-1', now)
+  expect(getClaudeSession(s, 'C1', 'T1', now)).toBe('uuid-1')
+})
+
+test('claudeSessions: getClaudeSession returns undefined past TTL', () => {
+  const s: ClaudeSessions = {}
+  const past = Date.now() - CLAUDE_SESSION_TTL_MS - 1000
+  setClaudeSession(s, 'C1', 'T1', 'uuid-1', past)
+  expect(getClaudeSession(s, 'C1', 'T1', Date.now())).toBeUndefined()
+})
+
+test('claudeSessions: pruneClaudeSessions removes expired entries', () => {
+  const now = Date.now()
+  const s: ClaudeSessions = {
+    'C1:T1': { sessionId: 'old',     expiresAt: now - 1 },
+    'C1:T2': { sessionId: 'fresh',   expiresAt: now + 60_000 },
+  }
+  expect(pruneClaudeSessions(s, now)).toBe(true)
+  expect(Object.keys(s)).toEqual(['C1:T2'])
+})
+
+test('claudeSessions: per-thread isolation — different thread, different session', () => {
+  const s: ClaudeSessions = {}
+  const now = Date.now()
+  setClaudeSession(s, 'C1', 'T1', 'uuid-A', now)
+  setClaudeSession(s, 'C1', 'T2', 'uuid-B', now)
+  expect(getClaudeSession(s, 'C1', 'T1', now)).toBe('uuid-A')
+  expect(getClaudeSession(s, 'C1', 'T2', now)).toBe('uuid-B')
+})
+
+// --- scrubTokens ---
+
+function scrubTokens_inline(s: string): string {
+  return s.replace(/(xox[a-z]-|xapp-)[A-Za-z0-9-]+/g, '[REDACTED]')
+}
+
+test('scrubTokens: redacts xoxb tokens in error strings', () => {
+  expect(scrubTokens_inline('failed: xoxb-1234-abcd-token bad'))
+    .toBe('failed: [REDACTED] bad')
+})
+
+test('scrubTokens: redacts xapp tokens too', () => {
+  expect(scrubTokens_inline('Socket Mode: xapp-1-A-deadbeef'))
+    .toBe('Socket Mode: [REDACTED]')
+})
+
+test('scrubTokens: leaves non-token strings untouched', () => {
+  expect(scrubTokens_inline('plain message no secrets'))
+    .toBe('plain message no secrets')
+})
+
+// --- Prompt construction ---
+
+type RunMeta = { chat_id: string; thread_id: string; user_id: string; hermes_session_key: string }
+
+function buildClaudePrompt(content: string, meta: RunMeta, attachments: string[]): string {
+  const lines = [
+    `[slack chat_id=${meta.chat_id} thread_id=${meta.thread_id} user_id=${meta.user_id}]`,
+    `[hermes_session_key=${meta.hermes_session_key}]`,
+  ]
+  if (attachments.length > 0) lines.push(`[attachments: ${attachments.join('; ')}]`)
+  lines.push('', content)
+  return lines.join('\n')
+}
+
+test('buildClaudePrompt: includes meta header and content', () => {
+  const meta: RunMeta = {
+    chat_id: 'C0AV95P4E91',
+    thread_id: '1777524940.159289',
+    user_id: 'U0ASEMZU50C',
+    hermes_session_key: 'agent:main:slack:group:C0AV95P4E91:1777524940.159289',
+  }
+  const out = buildClaudePrompt('hello', meta, [])
+  expect(out).toContain('chat_id=C0AV95P4E91')
+  expect(out).toContain('thread_id=1777524940.159289')
+  expect(out).toContain('user_id=U0ASEMZU50C')
+  expect(out).toContain('hermes_session_key=agent:main:slack:group:')
+  expect(out.endsWith('hello')).toBe(true)
+})
+
+test('buildClaudePrompt: includes attachments line when present', () => {
+  const meta: RunMeta = { chat_id: 'C1', thread_id: 'T1', user_id: 'U1', hermes_session_key: 'k' }
+  const out = buildClaudePrompt('hi', meta, ['photo.png (image/png, 100KB)'])
+  expect(out).toContain('[attachments: photo.png (image/png, 100KB)]')
+})
+
+test('buildClaudePrompt: no attachments line when empty', () => {
+  const meta: RunMeta = { chat_id: 'C1', thread_id: 'T1', user_id: 'U1', hermes_session_key: 'k' }
+  const out = buildClaudePrompt('hi', meta, [])
+  expect(out).not.toContain('[attachments')
+})

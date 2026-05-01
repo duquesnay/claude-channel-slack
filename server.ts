@@ -19,7 +19,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { App, type Logger, LogLevel } from '@slack/bolt'
-import { randomBytes } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
+import { spawn } from 'child_process'
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync,
   rmSync, renameSync, realpathSync, chmodSync,
@@ -30,9 +31,14 @@ import { join, sep } from 'path'
 const STATE_DIR = process.env.SLACK_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'slack')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENGAGED_FILE = join(STATE_DIR, 'engaged-threads.json')
+const CLAUDE_SESSIONS_FILE = join(STATE_DIR, 'claude-sessions.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+
+const CLAUDE_BIN = process.env.CLAUDE_BIN ?? '/opt/homebrew/bin/claude'
+const CLAUDE_TIMEOUT_MS = 120_000  // 2 min hard cap per spawn
+const CLAUDE_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000  // mirror engaged-threads
 
 // Load ~/.claude/channels/slack/.env into process.env. Real env wins.
 try {
@@ -233,6 +239,77 @@ function isEngaged(channelId: string, threadTs: string): boolean {
   } catch {
     return false
   }
+}
+
+// --- Claude session continuity per Slack thread ---
+// Maps `${chatId}:${threadRootTs}` → { sessionId, expiresAt }. We pass the
+// session_id to `claude --session-id` on the first spawn for a thread, then
+// `claude --resume <id>` on subsequent spawns so the agent carries the
+// thread's conversation context across messages. Same TTL as engaged-threads.
+
+type ClaudeSession = { sessionId: string; expiresAt: number }
+type ClaudeSessions = Record<string, ClaudeSession>
+
+export function pruneClaudeSessions(sessions: ClaudeSessions, now: number): boolean {
+  let changed = false
+  for (const key of Object.keys(sessions)) {
+    if (sessions[key]!.expiresAt <= now) { delete sessions[key]; changed = true }
+  }
+  return changed
+}
+
+export function setClaudeSession(sessions: ClaudeSessions, chatId: string, threadRootTs: string, sessionId: string, now: number): void {
+  sessions[engagedKey(chatId, threadRootTs)] = { sessionId, expiresAt: now + CLAUDE_SESSION_TTL_MS }
+}
+
+export function getClaudeSession(sessions: ClaudeSessions, chatId: string, threadRootTs: string, now: number): string | undefined {
+  const e = sessions[engagedKey(chatId, threadRootTs)]
+  return e && e.expiresAt > now ? e.sessionId : undefined
+}
+
+function readClaudeSessions(): ClaudeSessions {
+  try {
+    return JSON.parse(readFileSync(CLAUDE_SESSIONS_FILE, 'utf8')) as ClaudeSessions
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      try { renameSync(CLAUDE_SESSIONS_FILE, CLAUDE_SESSIONS_FILE + '.corrupt') } catch {}
+      process.stderr.write(`slack: claude-sessions.json was corrupt, moved aside. Starting fresh.\n`)
+    }
+    return {}
+  }
+}
+
+function writeClaudeSessions(sessions: ClaudeSessions): void {
+  const tmp = CLAUDE_SESSIONS_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify(sessions) + '\n', { mode: 0o600 })
+  renameSync(tmp, CLAUDE_SESSIONS_FILE)
+}
+
+function persistClaudeSession(chatId: string, threadRootTs: string, sessionId: string): void {
+  try {
+    const now = Date.now()
+    const sessions = readClaudeSessions()
+    pruneClaudeSessions(sessions, now)
+    setClaudeSession(sessions, chatId, threadRootTs, sessionId, now)
+    writeClaudeSessions(sessions)
+  } catch (err) {
+    process.stderr.write(`slack: failed to persist claude session ${chatId}:${threadRootTs} → ${sessionId}: ${err}\n`)
+  }
+}
+
+function lookupClaudeSession(chatId: string, threadRootTs: string): string | undefined {
+  try {
+    const now = Date.now()
+    return getClaudeSession(readClaudeSessions(), chatId, threadRootTs, now)
+  } catch {
+    return undefined
+  }
+}
+
+// --- Token scrub (used in stderr capture for failed claude -p spawns) ---
+
+export function scrubTokens(s: string): string {
+  return s.replace(/(xox[a-z]-|xapp-)[A-Za-z0-9-]+/g, '[REDACTED]')
 }
 
 // --- Runtime state ---
@@ -694,6 +771,106 @@ const app = new App({
   logger: stderrLogger,
 })
 
+// --- claude -p invocation (real reply path) ---
+//
+// Why a subprocess per inbound rather than --channels MCP notifications:
+// docs/channels-investigation.md captures the YJ_/tengu_harbor_ledger story.
+// claude-channel-slack@nestor is a third-party plugin not on Anthropic's
+// approved channels allowlist, so notifications/claude/channel are silently
+// dropped at capability registration time. Spawning `claude -p` directly
+// sidesteps the gate entirely — every message gets a real agent turn,
+// continuity preserved per Slack thread via --session-id / --resume.
+
+type RunMeta = {
+  chat_id: string
+  thread_id: string
+  user_id: string
+  hermes_session_key: string
+}
+
+export function buildClaudePrompt(content: string, meta: RunMeta, attachments: string[]): string {
+  const lines = [
+    `[slack chat_id=${meta.chat_id} thread_id=${meta.thread_id} user_id=${meta.user_id}]`,
+    `[hermes_session_key=${meta.hermes_session_key}]`,
+  ]
+  if (attachments.length > 0) lines.push(`[attachments: ${attachments.join('; ')}]`)
+  lines.push('', content)
+  return lines.join('\n')
+}
+
+export function buildClaudeSystemPrompt(meta: RunMeta): string {
+  return [
+    'You are Claude responding inside a Slack thread via the claude-channel-slack bridge.',
+    'The wrapping bun server posts your stdout back to Slack as a thread reply.',
+    '',
+    'Hermes context — invoke the hermes-bridge skill:',
+    '- Read ~/.hermes/memories/MEMORY.md and USER.md once for shared household context.',
+    `- When the Slack thread alone is insufficient, call mcp__hermes__messages_read with session_key=${meta.hermes_session_key} (limit=10).`,
+    '- Read-only: never call mcp__hermes__messages_send (that posts as Jaskier).',
+    '',
+    'Reply concisely (Slack thread, not a doc). Markdown minimal. English in channels, French in DMs with Guillaume (U0ASEMZU50C).',
+  ].join('\n')
+}
+
+async function runClaudeAndReply(content: string, meta: RunMeta, attachments: string[], replyToTs: string): Promise<void> {
+  const existing = lookupClaudeSession(meta.chat_id, meta.thread_id)
+  const sessionId = existing ?? randomUUID()
+  const prompt = buildClaudePrompt(content, meta, attachments)
+  const sysPrompt = buildClaudeSystemPrompt(meta)
+
+  const args = existing
+    ? ['--resume', sessionId, '-p', prompt, '--output-format', 'text']
+    : ['--session-id', sessionId, '-p', prompt, '--output-format', 'text', '--append-system-prompt', sysPrompt]
+
+  const child = spawn(CLAUDE_BIN, args, {
+    cwd: homedir(),
+    env: {
+      HOME: process.env.HOME ?? homedir(),
+      PATH: process.env.PATH ?? '/opt/homebrew/bin:/usr/bin:/bin',
+      LANG: process.env.LANG ?? 'en_US.UTF-8',
+      ...(process.env.CLAUDE_CODE_OAUTH_TOKEN ? { CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN } : {}),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', d => { stdout += d.toString() })
+  child.stderr.on('data', d => { stderr += d.toString() })
+
+  let timedOut = false
+  const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 5_000) }, CLAUDE_TIMEOUT_MS)
+
+  const exitCode = await new Promise<number>(resolve => child.on('exit', code => resolve(code ?? -1)))
+  clearTimeout(timer)
+
+  if (timedOut) {
+    process.stderr.write(`slack: claude -p timed out after ${CLAUDE_TIMEOUT_MS}ms (thread ${meta.chat_id}:${meta.thread_id})\n`)
+    await postReply(meta.chat_id, replyToTs, `:hourglass_flowing_sand: timed out after ${Math.round(CLAUDE_TIMEOUT_MS / 1000)}s, no reply.`)
+    return
+  }
+
+  if (exitCode !== 0) {
+    process.stderr.write(`slack: claude -p exit=${exitCode} stderr=${scrubTokens(stderr).slice(0, 800)}\n`)
+    await postReply(meta.chat_id, replyToTs, `:warning: claude -p failed (exit ${exitCode}). See daemon stderr.`)
+    return
+  }
+
+  if (!existing) persistClaudeSession(meta.chat_id, meta.thread_id, sessionId)
+
+  const reply = stdout.trim()
+  if (!reply) return  // empty stdout: agent chose not to reply
+  await postReply(meta.chat_id, replyToTs, reply)
+}
+
+async function postReply(chatId: string, threadTs: string, text: string): Promise<void> {
+  try {
+    await app.client.chat.postMessage({ channel: chatId, thread_ts: threadTs, text })
+  } catch (err) {
+    process.stderr.write(`slack: failed to post reply to ${chatId}/${threadTs}: ${scrubTokens(String(err)).slice(0, 400)}\n`)
+  }
+}
+
 // --- Inbound message handler ---
 
 type SlackMessage = {
@@ -787,24 +964,19 @@ async function handleInbound(msg: SlackMessage & { user: string }): Promise<void
 
   const content = text || (atts.length > 0 ? '(attachment)' : '')
   const threadRootTs = msg.thread_ts ?? ts
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content,
-      meta: {
-        chat_id: channelId,
-        message_id: ts,
-        user: userId,
-        user_id: userId,
-        ts: new Date(parseFloat(ts) * 1000).toISOString(),
-        thread_id: threadRootTs,
-        hermes_session_key: hermesSessionKey(channelType, channelId, threadRootTs),
-        ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
-      },
-    },
-  }).catch(err => {
-    process.stderr.write(`slack channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  const meta: RunMeta = {
+    chat_id: channelId,
+    thread_id: threadRootTs,
+    user_id: userId,
+    hermes_session_key: hermesSessionKey(channelType, channelId, threadRootTs),
+  }
+  // Reply target: when bot is mentioned in a top-level message, replyToTs = msg.ts
+  // creates a thread under the mention. Subsequent thread replies have
+  // msg.thread_ts set, so replyToTs = msg.thread_ts ?? msg.ts = thread root.
+  const replyToTs = msg.thread_ts ?? msg.ts
+  // Fire-and-forget: claude -p subprocess can run for up to CLAUDE_TIMEOUT_MS,
+  // we don't block the inbound handler on it.
+  void runClaudeAndReply(content, meta, atts, replyToTs)
 }
 
 // --- Permission button handlers ---
