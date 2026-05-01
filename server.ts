@@ -1059,8 +1059,13 @@ function shutdown(): void {
   setTimeout(() => process.exit(0), 2000)
   void app.stop().finally(() => process.exit(0))
 }
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
+// SIGTERM/SIGINT only — covers both deployment modes:
+//   - launchd standalone (this is the active deploy mode): no stdin, kill via SIGTERM
+//   - MCP child of `claude --channels`: parent kills the child group via SIGTERM
+// Earlier versions also bound process.stdin.on('end'/'close', shutdown) to
+// react when the MCP parent closed stdin. But standalone has stdin closed
+// from boot → those handlers would fire instantly → process exits → KeepAlive
+// respawns → infinite loop. SIGTERM alone is sufficient and unambiguous.
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
