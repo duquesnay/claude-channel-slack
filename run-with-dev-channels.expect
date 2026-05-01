@@ -1,0 +1,48 @@
+#!/usr/bin/expect -f
+# Expect wrapper for claude --channels.
+#
+# Why: claude-channel-slack@nestor is a third-party plugin and not in the
+# Anthropic-controlled `tengu_harbor_ledger` GrowthBook ledger of approved
+# channel plugins. Without --dangerously-load-development-channels the
+# YJ_ capability registration check returns {action:"skip", kind:"allowlist"},
+# the experimental claude/channel capability is never registered, and the
+# daemon receives Slack notifications but never invokes the agent.
+#
+# The flag itself works but triggers a React confirmation prompt that a
+# headless LaunchDaemon (script -q /dev/null) cannot accept. This wrapper
+# spawns claude in an expect-managed PTY, watches for the prompt, and
+# auto-sends Enter to confirm. After confirmation it falls through to
+# expect-eof and waits for the child to exit (SIGTERM from launchd will
+# kill the wrapper which closes the PTY, killing claude).
+
+log_user 1
+exp_internal 0
+set env(COLUMNS) 200
+set env(LINES) 60
+set timeout 60
+
+# stty_init makes expect set the spawned PTY width before claude inspects it
+spawn -nottyinit /opt/homebrew/bin/claude \
+    --dangerously-load-development-channels plugin:claude-channel-slack@nestor \
+    --channels plugin:claude-channel-slack@nestor \
+    --permission-mode acceptEdits
+
+set ptypid [exp_pid]
+puts stderr "wrapper: spawned claude pid=$ptypid"
+stty rows 60 columns 200 < $spawn_out(slave,name)
+
+# React/Ink renders the dialog with cursor positioning, fragmenting "Enter to
+# confirm" across direct cursor-move sequences — expect's stream pattern
+# matcher can't reliably catch it. Simpler: wait a few seconds for the dialog
+# to be fully drawn, then blindly send Enter. The dialog accepts Enter for
+# confirm so the worst case if we mistime is no-op.
+sleep 5
+puts stderr "wrapper: sending \\r to accept dev-channels prompt"
+send "\r"
+
+set timeout -1
+expect eof
+puts stderr "wrapper: claude exited"
+
+set timeout -1
+expect eof
