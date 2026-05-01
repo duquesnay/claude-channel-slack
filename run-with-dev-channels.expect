@@ -22,9 +22,23 @@ set env(LINES) 60
 set timeout 60
 
 # stty_init makes expect set the spawned PTY width before claude inspects it
+# Pass ONLY --dangerously-load-development-channels, NOT --channels.
+# Both flags add to a merged channel list with `dev` field set per source.
+# gZH (the lookup function used by YJ_ capability registration) does
+# Array.find which returns the FIRST match by name. If --channels appears
+# alongside --dangerously, two entries with the same name exist (one with
+# dev:false, one with dev:true), gZH finds dev:false first, YJ_ returns
+# {action:"skip", kind:"allowlist"}, the experimental claude/channel
+# capability is never registered, and inbound Slack notifications never
+# trigger an agent turn — even though the bun MCP server processes them
+# (eye reaction fires) and writes engaged-threads.json.
+#
+# Empirically the dev flag alone is enough to (a) activate listening and
+# (b) put the entry on the active channels list with dev:true. Dropping
+# --channels gives us a single entry with dev:true → gZH finds it →
+# YJ_ returns {action:"register"} → agent loop fires.
 spawn -nottyinit /opt/homebrew/bin/claude \
     --dangerously-load-development-channels plugin:claude-channel-slack@nestor \
-    --channels plugin:claude-channel-slack@nestor \
     --permission-mode acceptEdits
 
 set ptypid [exp_pid]
